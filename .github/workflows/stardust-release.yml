@@ -1,0 +1,166 @@
+name: Stardust release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stardust-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and publish the application image
+        id: image
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          metadata="$RUNNER_TEMP/stardust-image.json"
+          build_args=()
+          if [[ "${GITHUB_REPOSITORY,,}" == "1467698764/cliproxyapi" ]]; then
+            build_args+=(--build-arg "VERSION=main-${GITHUB_SHA:0:12}"
+              --build-arg "COMMIT=$GITHUB_SHA"
+              --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          fi
+          docker buildx build --platform linux/amd64 --push \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file "$metadata" \
+            --tag "$image:sha-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "${build_args[@]}" .
+          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata")
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Built `%s@%s` from `%s`.\n' "$image" "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  rehearsal:
+    name: Deploy to rehearsal
+    if: vars.STARDUST_DEPLOY_TARGET == 'rehearsal' || vars.STARDUST_DEPLOY_TARGET == 'production'
+    needs: image
+    environment: stardust-rehearsal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      STARDUST_SSH_USER: stardust-deploy
+    permissions: &deploy-permissions
+      contents: read
+      packages: read
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps: &deploy-steps
+      - name: Send this release to the private deployment endpoint
+        id: deploy
+        shell: bash
+        env:
+          REGISTRY_DIGEST: ${{ needs.image.outputs.digest }}
+          STARDUST_SSH_HOST: ${{ secrets.STARDUST_SSH_HOST }}
+          STARDUST_SSH_PORT: ${{ vars.STARDUST_SSH_PORT }}
+          STARDUST_SSH_KEY: ${{ secrets.STARDUST_SSH_KEY }}
+          STARDUST_KNOWN_HOSTS: ${{ secrets.STARDUST_KNOWN_HOSTS }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$head_sha" != "$GITHUB_SHA" ]]; then
+            printf 'Skipped superseded commit `%s`; `main` is now `%s`.\n' "$GITHUB_SHA" "$head_sha" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "$REGISTRY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ -n "$STARDUST_SSH_HOST" && -n "$STARDUST_SSH_KEY" && -n "$STARDUST_KNOWN_HOSTS" ]]
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -f -- "$ssh_dir/key" "$ssh_dir/known_hosts"; rmdir -- "$ssh_dir"' EXIT
+          printf '%s\n' "$STARDUST_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$STARDUST_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          printf '%s %s\n%s %s\n' "$GITHUB_SHA" "$REGISTRY_DIGEST" "$GITHUB_ACTOR" "$GH_TOKEN" | ssh -T \
+            -o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$ssh_dir/known_hosts" -o IdentitiesOnly=yes \
+            -p "${STARDUST_SSH_PORT:-22}" -i "$ssh_dir/key" -- "$STARDUST_SSH_USER@$STARDUST_SSH_HOST"
+          printf 'deployed=true\n' >> "$GITHUB_OUTPUT"
+          printf 'Coolify container health passed for `%s`.\n' "$REGISTRY_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  production:
+    name: Deploy to production
+    if: vars.STARDUST_DEPLOY_TARGET == 'production' && needs.rehearsal.outputs.deployed == 'true'
+    needs: [image, rehearsal]
+    environment: stardust-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      STARDUST_SSH_USER: stardust-prod-deploy
+    permissions: *deploy-permissions
+    steps: *deploy-steps
+
+  alert:
+    if: >-
+      always() && vars.STARDUST_ALERTS_ENABLED == 'true' &&
+      (needs.image.result == 'failure' || needs.rehearsal.result == 'failure' || needs.production.result == 'failure')
+    needs: [image, rehearsal, production]
+    environment: stardust-alerting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Email the release failure
+        env:
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          BUILD_RESULT: ${{ needs.image.result }}
+          REHEARSAL_RESULT: ${{ needs.rehearsal.result }}
+          PRODUCTION_RESULT: ${{ needs.production.result }}
+        run: |
+          python3 - <<'PY'
+          from email.message import EmailMessage
+          from os import environ as env
+          import smtplib
+          import ssl
+
+          project = env["GITHUB_REPOSITORY"]
+          link = f'{env["GITHUB_SERVER_URL"]}/{project}/actions/runs/{env["GITHUB_RUN_ID"]}'
+          message = EmailMessage()
+          message["Subject"] = f'Stardust release failed: {project}'
+          message["From"], message["To"] = env["ALERT_FROM"], env["ALERT_TO"]
+          message.set_content(
+              f'Commit: {env["GITHUB_SHA"]}\n'
+              f'Build: {env["BUILD_RESULT"]}\nRehearsal: {env["REHEARSAL_RESULT"]}\n'
+              f'Production: {env["PRODUCTION_RESULT"]}\n{link}\n'
+          )
+          port = int(env["SMTP_PORT"] or "587")
+          tls = ssl.create_default_context()
+          if port == 465:
+              connection = smtplib.SMTP_SSL(env["SMTP_HOST"], port, context=tls, timeout=25)
+          elif port == 587:
+              connection = smtplib.SMTP(env["SMTP_HOST"], port, timeout=25)
+          else:
+              raise SystemExit("SMTP must use TLS port 465 or STARTTLS port 587")
+          with connection:
+              if port == 587:
+                  connection.starttls(context=tls)
+              connection.login(env["SMTP_USERNAME"], env["SMTP_PASSWORD"])
+              if connection.send_message(message):
+                  raise SystemExit("SMTP rejected a configured recipient")
+          PY
