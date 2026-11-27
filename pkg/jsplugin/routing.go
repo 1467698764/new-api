@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/regexp"
+	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
 )
 
@@ -246,6 +247,9 @@ const (
 	ContextKeyPinnedEndpoint  = "task_plugin_pinned_endpoint"
 	ContextKeyRouteRequest    = "task_plugin_route_request"
 	ContextKeyProtocolRequest = "task_plugin_protocol_request"
+	// ContextKeyEffectiveImageRequest holds the current attempt's image request
+	// after channel overrides. ProtocolRequest remains the immutable retry source.
+	ContextKeyEffectiveImageRequest = "task_plugin_effective_image_request"
 	// ContextKeyRequestBodyText holds, for a plugin that preserves JSON
 	// order, the decoded requestBody as JSON text (json.RawMessage) beside
 	// the Go value in task_request.
@@ -287,6 +291,17 @@ type PinnedEndpoint struct {
 	Model       string
 	MappedModel string
 	Candidates  []ProtocolBinding
+}
+
+// DiscardsImmediateResult reports whether this submission delivers a terminal
+// result inline and omits its task data from storage.
+func DiscardsImmediateResult(c *gin.Context) bool {
+	route, _ := common.GetContextKeyType[PinnedRoute](c, ContextKeyPinnedRoute)
+	if route.Route.RetainResult != nil && !*route.Route.RetainResult {
+		return true
+	}
+	endpoint, _ := common.GetContextKeyType[PinnedEndpoint](c, ContextKeyPinnedEndpoint)
+	return endpoint.Protocol == ProtocolOpenAIImage
 }
 
 // FileReference returns the opaque ref of the index-th uploaded file in a
